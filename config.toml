@@ -1,0 +1,32 @@
+# Baidu Chat API Configuration
+# 不填 cookies 时会自动从 chat.baidu.com 首页获取
+
+[cookies]
+# 手动提供 Cookie 字符串（可选，留空则自动获取）
+# value = "BAIDUID=xxx; BIDUPSID=xxx; PSTM=xxx; ..."
+value = ""
+
+[server]
+host = "0.0.0.0"
+port = 8000
+
+[models]
+# Map OpenAI model names to Baidu models
+wenxin = "ernie-4.5"
+deepseek_r1 = "deepseek-r1"
+dsv4pro = "deepseek-v4-pro"
+
+[headers]
+# Optional custom User-Agent
+user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+
+[cookie_persistence]
+# Cookie 自动持久化文件路径
+cookie_file = "cookies.json"
+# 是否自动保存获取到的 Cookie
+auto_save_cookies = true
+
+[options]
+# Default settings
+default_model = "ernie-4.5"
+stream = true
