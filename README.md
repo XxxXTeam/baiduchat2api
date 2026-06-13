@@ -29,7 +29,20 @@ chat_token = base64("{token}|{MD5(query)}|{timestamp}|{lid}")-{lid}-3
 - SSE 响应中解析 `thinking` / `thinking_content` / `reasoning` 字段
 - 转换为 OpenAI 的 `reasoning_content` 字段
 
-### 5. 文件结构
+### 5. 工具调用支持
+- 请求中传入 OpenAI 兼容的 `tools` 后，服务端会自动追加系统提示词
+- 上游模型按 XML 输出标准工具结构：
+```xml
+<tool_calls>
+  <tool_call>
+    <name>get_weather</name>
+    <arguments>{"city":"北京"}</arguments>
+  </tool_call>
+</tool_calls>
+```
+- 服务端会解析 XML，并返回 OpenAI 兼容的 `message.tool_calls`
+
+### 6. 文件结构
 ```
 ├── baidu_chat.py      # 核心逆向客户端 (纯算法)
 ├── main.py            # OpenAI 兼容 API 服务器
@@ -70,7 +83,51 @@ curl http://localhost:8000/v1/chat/completions \
   }'
 ```
 
-### 5. CLI 直接调用
+### 5. 工具调用示例
+```bash
+curl http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "baidu-smart",
+    "messages": [{"role": "user", "content": "北京天气怎么样"}],
+    "tools": [{
+      "type": "function",
+      "function": {
+        "name": "get_weather",
+        "description": "Get weather by city",
+        "parameters": {
+          "type": "object",
+          "properties": {"city": {"type": "string"}},
+          "required": ["city"]
+        }
+      }
+    }],
+    "stream": false
+  }'
+```
+
+返回中的工具调用：
+```json
+{
+  "choices": [{
+    "message": {
+      "role": "assistant",
+      "content": "",
+      "tool_calls": [{
+        "id": "call_xxx",
+        "type": "function",
+        "function": {
+          "name": "get_weather",
+          "arguments": "{\"city\":\"北京\"}"
+        }
+      }]
+    },
+    "finish_reason": "tool_calls"
+  }]
+}
+```
+
+### 6. CLI 直接调用
 ```bash
 python baidu_chat.py "1+1等于几" --model deepseek
 python baidu_chat.py "hello" --model smart

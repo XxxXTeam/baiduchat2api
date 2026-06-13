@@ -28,6 +28,10 @@ def test_flask_server():
     mock_client._ori_lid = "test_lid"
 
     def fake_stream(query, model="smart", deep_search=False, internet_search=False):
+        if "<tool_calls>" in query or "Available tools:" in query:
+            yield {"type": "text", "content": '<tool_calls><tool_call><name>get_weather</name><arguments>{"city":"北京"}</arguments></tool_call></tool_calls>'}
+            yield {"type": "done", "content": ""}
+            return
         yield {"type": "text", "content": "Hello"}
         yield {"type": "thinking", "content": "Let me think..."}
         yield {"type": "text", "content": " world!"}
@@ -104,6 +108,62 @@ def test_flask_server():
             "status": r.status_code,
             "has_reasoning": msg.get("reasoning_content") is not None,
             "content": msg.get("content", "")[:50],
+        })
+
+        # Test 5: Tool calling sync
+        tools = [{
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "description": "Get weather by city",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                    "required": ["city"],
+                },
+            },
+        }]
+        r = tc.post("/v1/chat/completions",
+                    json={
+                        "model": "baidu-smart",
+                        "messages": [{"role": "user", "content": "北京天气"}],
+                        "tools": tools,
+                        "tool_choice": {"type": "function", "function": {"name": "get_weather"}},
+                        "stream": False,
+                    })
+        data = r.get_json()
+        choice = data.get("choices", [{}])[0]
+        msg = choice.get("message", {})
+        results.append({
+            "test": "tool_call_sync",
+            "status": r.status_code,
+            "finish_reason": choice.get("finish_reason"),
+            "tool_name": msg.get("tool_calls", [{}])[0].get("function", {}).get("name"),
+            "arguments": msg.get("tool_calls", [{}])[0].get("function", {}).get("arguments"),
+        })
+
+        # Test 6: Tool calling stream
+        r = tc.post("/v1/chat/completions",
+                    json={"model": "baidu-smart", "messages": [{"role": "user", "content": "北京天气"}], "tools": tools, "stream": True})
+        raw = r.data.decode("utf-8")
+        tool_delta = None
+        finish_reason = None
+        for ln in [ln for ln in raw.strip().split("\n") if ln.startswith("data: ")]:
+            payload = ln[6:]
+            if payload == "[DONE]":
+                continue
+            d = json.loads(payload)
+            choice = d.get("choices", [{}])[0]
+            delta = choice.get("delta", {})
+            if delta.get("tool_calls"):
+                tool_delta = delta["tool_calls"][0]
+            if choice.get("finish_reason"):
+                finish_reason = choice["finish_reason"]
+        results.append({
+            "test": "tool_call_stream",
+            "status": r.status_code,
+            "finish_reason": finish_reason,
+            "tool_name": (tool_delta or {}).get("function", {}).get("name"),
         })
 
     return results

@@ -6,6 +6,7 @@ from typing import Optional, Dict, Any
 
 from flask import Flask, request, jsonify, Response
 from baidu_chat import BaiduChatClient, _log
+from tool_calling import messages_to_prompt, parse_tool_calls
 
 
 # ------------------------------------------------------------------
@@ -73,26 +74,6 @@ MODEL_MAP = {
 }
 
 
-def _build_query(messages: list) -> str:
-    if not isinstance(messages, list):
-        return ""
-    for msg in reversed(messages):
-        if not isinstance(msg, dict):
-            continue
-        if msg.get("role") == "user":
-            content = msg.get("content", "")
-            if isinstance(content, str):
-                return content
-            elif isinstance(content, list):
-                texts = [
-                    item.get("text", "")
-                    for item in content
-                    if isinstance(item, dict) and item.get("type") == "text"
-                ]
-                return "\n".join(texts)
-    return ""
-
-
 def _error(message: str, status: int = 400, err_type: str = "invalid_request"):
     return jsonify({"error": {"message": message, "type": err_type}}), status
 
@@ -141,24 +122,27 @@ def chat_completions():
 
     model = req.get("model", "baidu-ernie-4.5")
     messages = req.get("messages", [])
+    tools = req.get("tools") or []
+    tool_choice = req.get("tool_choice")
     stream = req.get("stream", False)
 
     baidu_model = MODEL_MAP.get(model, "ernie-4.5")
     deep_search = bool(req.get("deep_search", False))
-    query = _build_query(messages)
+    query = messages_to_prompt(messages, tools if isinstance(tools, list) else [], tool_choice)
 
     if not query:
         return _error("No user message found")
 
-    _log("INFO", f"POST /v1/chat/completions  model={model}  stream={stream}  query_len={len(query)}")
+    _log("INFO", f"POST /v1/chat/completions  model={model}  stream={stream}  tools={len(tools) if isinstance(tools, list) else 0}  query_len={len(query)}")
 
+    has_tools = isinstance(tools, list) and bool(tools)
     if stream:
-        return _handle_stream(query, baidu_model, deep_search, model)
+        return _handle_stream(query, baidu_model, deep_search, model, has_tools)
     else:
         return _handle_sync(query, baidu_model, deep_search, model)
 
 
-def _handle_stream(query: str, baidu_model: str, deep_search: bool, display_model: str):
+def _handle_stream(query: str, baidu_model: str, deep_search: bool, display_model: str, has_tools: bool = False):
     if not client:
         return _error("Client not initialized", 500, "internal_error")
 
@@ -175,9 +159,28 @@ def _handle_stream(query: str, baidu_model: str, deep_search: bool, display_mode
         })
 
         try:
+            content_parts = []
+            reasoning_parts = []
             for chunk in client.chat_to_openai_chunks(query, model=baidu_model, deep_search=deep_search):
                 content = chunk.get("content")
-                if content:
+                if not content:
+                    continue
+                if chunk["type"] == "content":
+                    content_parts.append(content)
+                    if not has_tools:
+                        yield _sse({
+                            "id": "chatcmpl-baidu",
+                            "object": "chat.completion.chunk",
+                            "created": int(time.time()),
+                            "model": display_model,
+                            "choices": [{
+                                "index": 0,
+                                "delta": {"content": content},
+                                "finish_reason": None,
+                            }],
+                        })
+                elif chunk["type"] == "reasoning_content":
+                    reasoning_parts.append(content)
                     yield _sse({
                         "id": "chatcmpl-baidu",
                         "object": "chat.completion.chunk",
@@ -185,10 +188,63 @@ def _handle_stream(query: str, baidu_model: str, deep_search: bool, display_mode
                         "model": display_model,
                         "choices": [{
                             "index": 0,
-                            "delta": {chunk["type"]: content},
+                            "delta": {"reasoning_content": content},
                             "finish_reason": None,
                         }],
                     })
+
+            parsed_content, tool_calls = parse_tool_calls("".join(content_parts))
+            if tool_calls:
+                if parsed_content:
+                    yield _sse({
+                        "id": "chatcmpl-baidu",
+                        "object": "chat.completion.chunk",
+                        "created": int(time.time()),
+                        "model": display_model,
+                        "choices": [{
+                            "index": 0,
+                            "delta": {"content": parsed_content},
+                            "finish_reason": None,
+                        }],
+                    })
+                for idx, tool_call in enumerate(tool_calls):
+                    yield _sse({
+                        "id": "chatcmpl-baidu",
+                        "object": "chat.completion.chunk",
+                        "created": int(time.time()),
+                        "model": display_model,
+                        "choices": [{
+                            "index": 0,
+                            "delta": {"tool_calls": [{
+                                "index": idx,
+                                "id": tool_call["id"],
+                                "type": "function",
+                                "function": tool_call["function"],
+                            }]},
+                            "finish_reason": None,
+                        }],
+                    })
+                yield _sse({
+                    "id": "chatcmpl-baidu",
+                    "object": "chat.completion.chunk",
+                    "created": int(time.time()),
+                    "model": display_model,
+                    "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}],
+                })
+                yield "data: [DONE]\n\n"
+                return
+            if has_tools and parsed_content:
+                yield _sse({
+                    "id": "chatcmpl-baidu",
+                    "object": "chat.completion.chunk",
+                    "created": int(time.time()),
+                    "model": display_model,
+                    "choices": [{
+                        "index": 0,
+                        "delta": {"content": parsed_content},
+                        "finish_reason": None,
+                    }],
+                })
         except Exception as e:
             _log("ERROR", f"Stream error: {e}")
             yield _sse({"error": str(e)})
@@ -212,12 +268,17 @@ def _handle_sync(query: str, baidu_model: str, deep_search: bool, display_model:
 
     try:
         result = client.chat_to_openai_sync(query, model=baidu_model, deep_search=deep_search)
+        content, tool_calls = parse_tool_calls(result.get("content", ""))
         message = {
             "role": "assistant",
-            "content": result.get("content", ""),
+            "content": content,
         }
         if result.get("reasoning_content"):
             message["reasoning_content"] = result["reasoning_content"]
+        finish_reason = "stop"
+        if tool_calls:
+            message["tool_calls"] = tool_calls
+            finish_reason = "tool_calls"
         return jsonify({
             "id": "chatcmpl-baidu",
             "object": "chat.completion",
@@ -226,7 +287,7 @@ def _handle_sync(query: str, baidu_model: str, deep_search: bool, display_model:
             "choices": [{
                 "index": 0,
                 "message": message,
-                "finish_reason": "stop",
+                "finish_reason": finish_reason,
             }],
         })
     except Exception as e:
